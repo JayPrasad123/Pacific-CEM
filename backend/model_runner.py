@@ -1,6 +1,15 @@
 import pandas as pd
 import pypsa
-from pypsa.optimization.compat import define_constraints, get_var, linexpr
+# pypsa.optimization.compat is the legacy (pre-linopy) constraint API. It was
+# removed in later PyPSA releases, and importing it unconditionally makes this
+# whole module fail to import there. The three add_*_constraint helpers below are
+# the only users; they are guarded so the model still runs without them.
+try:
+    from pypsa.optimization.compat import define_constraints, get_var, linexpr
+    LEGACY_CONSTRAINT_API = True
+except ImportError:  # PyPSA >= 0.30
+    define_constraints = get_var = linexpr = None
+    LEGACY_CONSTRAINT_API = False
 from datetime import datetime
 import numpy as np
 import os
@@ -34,9 +43,31 @@ def apply_cost_multiplier(carrier, base_capex, multipliers):
     return base_capex * factor
 
 
+def get_variable_profile_carriers():
+    """Carriers whose hourly output is CAPPED BY A TIME SERIES (p_max_pu profile).
+
+    This is a MECHANICAL list, not a policy list. A carrier belongs here only if
+    the model must read an 8760-hour availability profile for it. Dispatchable
+    plant - including biofuel/CNO thermal units - must NOT appear here: putting a
+    dispatchable carrier in this list forces p_max_pu=0 whenever no profile column
+    exists, which silently prevents it from ever generating.
+    """
+    return ["Solar", "Solar Rooftop", "Wind", "Hydro"]
+
+
 def get_renewable_carriers():
-    """Define which carriers are considered renewable energy sources"""
-    return ["Solar", "Solar Rooftop", "Wind", "Geothermal", "CNO", "Hydro", "Bio Power- CNO"]
+    """Carriers counted as renewable for RE-share accounting and the RE target.
+
+    This is a METHODOLOGICAL list. Membership determines what counts towards the
+    RE Share Target and the reported 'Achieved RE Share'. It has no effect on
+    whether a generator needs an availability profile - see
+    get_variable_profile_carriers() for that.
+
+    NOTE: 'Bio Power- CNO' is included here so that coconut-oil generation counts
+    towards renewable targets. That is a research decision, not a code
+    requirement - see the CNO note in the change log before altering it.
+    """
+    return ["Solar", "Solar Rooftop", "Wind", "Geothermal", "Hydro", "Bio Power- CNO"]
 
 # --- START OF FIX: Add get_dispatchable_carriers function ---
 def get_dispatchable_carriers():
@@ -46,6 +77,61 @@ def get_dispatchable_carriers():
     # The actual carriers providing generation that could be dispatchable are listed here.
     return ["Hydro", "Diesel", "Gas", "Bio Power- CNO", "Geothermal"] # Added Bio Power- CNO, Geothermal as they can be firm
 # --- END OF FIX ---
+
+# Fallback impedance for passive branches whose input data carries no x/r.
+# Representative per-km values for MV overhead line; only used to keep the
+# susceptance matrix non-singular, and always accompanied by a warning.
+DEFAULT_LINE_X_PER_KM = 0.35   # ohm/km
+DEFAULT_LINE_R_PER_KM = 0.20   # ohm/km
+DEFAULT_TRANSFORMER_X = 0.10   # per unit on s_nom base
+DEFAULT_TRANSFORMER_R = 0.01   # per unit on s_nom base
+
+
+def _num(value, default=0.0):
+    """Read a numeric spreadsheet cell safely.
+
+    float(x or default) is unsafe here: numpy.nan is truthy, so a blank cell
+    survives as nan, and every `nan <= 0` test is False - which silently defeated
+    the impedance defaults this module relies on.
+    """
+    if value is None:
+        return float(default)
+    try:
+        if pd.isna(value):
+            return float(default)
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _flag(value, default=False):
+    """Read a boolean spreadsheet cell safely.
+
+    bool() on a raw cell is unsafe: bool('FALSE'), bool('No'), bool('0') and
+    bool(nan) are all True, so a blank or text 'FALSE' cell silently made lines
+    and storage extendable.
+    """
+    if value is None:
+        return bool(default)
+    try:
+        if pd.isna(value):
+            return bool(default)
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "t", "yes", "y", "1"):
+            return True
+        if v in ("false", "f", "no", "n", "0", ""):
+            return False
+        return bool(default)
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value) != 0.0
+    return bool(value)
+
 
 def safe_add_carrier(n, name, **kw):
     """Adds a carrier if it doesn't already exist."""
@@ -222,7 +308,13 @@ def extract_key_metrics(n, scenario_name):
 
     metrics = {
         'Scenario': scenario_name,
-        'Total System Cost (USD)': n.objective if n.objective is not None else np.nan,
+        # n.objective is the VARIABLE part of the objective only. PyPSA holds the fixed
+        # capital of already-installed assets in n.objective_constant, so reporting
+        # n.objective alone understates total annualised system cost (and every LCOE
+        # derived from it). Measured on the Efate T1 CNO case: 18,750,523 vs a true
+        # 22,784,541 - an understatement of 17.7%.
+        'Total System Cost (USD)': (float(n.objective) + float(getattr(n, 'objective_constant', 0.0) or 0.0))
+                                   if getattr(n, 'objective', None) is not None else np.nan,
     }
 
     # Determine if slack is contributing (based on total generation)
@@ -1048,18 +1140,46 @@ def add_renewable_charging_constraint(n, snapshots):
     yield f"[{datetime.now().strftime('%H:%M:%S')}] Added Solar and Wind-only charging constraint for {len(snapshots)} hours."
 
 
+# Messages raised while building extra constraints. extra_functionality is called
+# by PyPSA inside n.optimize(), so it cannot yield into the run_model log stream;
+# it appends here instead and run_model drains the list after the solve.
+EXTRA_FUNCTIONALITY_LOG = []
+
+
 def combined_extra_functionality(n, snapshots, dispatchable_share, minimum_soc):
-    """Wrapper to call multiple extra functionality functions"""
-    # The yield statements from add_..._constraint functions are propagated
-    # by the generator that calls combined_extra_functionality.
-    # Pass along the parameters.
-    for log_msg in add_dispatchable_constraint(n, snapshots, dispatchable_share):
-        yield log_msg
-    for log_msg in add_minimum_soc_constraint(n, snapshots, minimum_soc):
-        yield log_msg
-    # if add_renewable_charging_constraint is ever made active, it would be called here:
-    for log_msg in add_renewable_charging_constraint(n, snapshots):
-        yield log_msg
+    """Wrapper to call multiple extra functionality functions.
+
+    IMPORTANT: this must be a plain function, not a generator. It was previously
+    written with `yield`, which meant calling it merely created a generator
+    object that PyPSA discarded without ever iterating it. The dispatchable-share,
+    minimum-SOC and renewable-charging constraints were therefore never added to
+    the optimisation problem - the settings appeared to be accepted but had no
+    effect on the result.
+    """
+    if not LEGACY_CONSTRAINT_API:
+        # Fail rather than warn. A run that silently ignores a constraint the user
+        # asked for is the same class of defect as a run that silently writes empty
+        # results - it produces a plausible number that answers a different question.
+        raise RuntimeError(
+            "The dispatchable-share, minimum-SOC and renewable-charging constraints are written "
+            "against the removed pypsa.optimization.compat API and cannot be applied on this PyPSA "
+            "version. Set Dispatchable Share and Minimum SOC to 0, or migrate these constraints to "
+            "the linopy API, before relying on this scenario.")
+
+    for fn, args in ((add_dispatchable_constraint, (n, snapshots, dispatchable_share)),
+                     (add_minimum_soc_constraint, (n, snapshots, minimum_soc)),
+                     (add_renewable_charging_constraint, (n, snapshots))):
+        try:
+            result = fn(*args)
+            # The add_*_constraint helpers are still generators; drain them so
+            # their bodies actually run and their messages are captured.
+            if hasattr(result, "__iter__") and not isinstance(result, (str, bytes)):
+                for log_msg in result:
+                    EXTRA_FUNCTIONALITY_LOG.append(log_msg)
+        except Exception as exc:
+            EXTRA_FUNCTIONALITY_LOG.append(
+                f"[{datetime.now().strftime('%H:%M:%S')}] ERROR: constraint '{fn.__name__}' could not be applied "
+                f"({type(exc).__name__}: {exc}). The corresponding setting has NOT been enforced in this run.")
 
 
 # --------------------------
@@ -1093,7 +1213,8 @@ def run_model(
         df_transformers,
         df_storage,
         df_generation_profiles,
-        df_scenario_year # This parameter is currently not used but kept for backward compatibility if needed
+        df_scenario_year, # This parameter is currently not used but kept for backward compatibility if needed
+        solver_options=None
 ):
     yield f"[{datetime.now().strftime('%H:%M:%S')}] Starting simulation for scenario: {scenario_name}"
 
@@ -1314,15 +1435,21 @@ def run_model(
         for gen_i, row in df_gen_processed.iterrows():
             carrier = row['Carrier']
             if not enabled_techs.get(carrier, True):
-                yield f"[{datetime.now().strftime('%H:%M:%M')}] Skipping generator '{gen_i}' (Carrier: {carrier}) as its technology is disabled."
+                yield f"[{datetime.now().strftime('%H:%M:%S')}] Skipping generator '{gen_i}' (Carrier: {carrier}) as its technology is disabled."
                 continue
 
             bus = row['Bus']
             if bus not in n.buses.index:
-                yield f"[{datetime.now().strftime('%H:%M:%M')}] WARNING: Generator '{gen_i}' refers to non-existent bus '{bus}'. Skipping."
+                yield f"[{datetime.now().strftime('%H:%M:%S')}] WARNING: Generator '{gen_i}' refers to non-existent bus '{bus}'. Skipping."
                 continue
 
             status = int(float(row.get('Status', 0)))  # 0 for existing, 1 for new
+            if status not in (0, 1):
+                # Only 0 and 1 are handled. Anything else falls through to the
+                # new-build branch and is given p_nom = 0, which silently disables the
+                # row. This is how the LoadShed generators - the workbook's own
+                # protection against infeasibility - were switched off.
+                yield f"[{datetime.now().strftime('%H:%M:%S')}] WARNING: Generator '{gen_i}' has Status = {status}, which is not recognised (only 0 = existing and 1 = new build are handled). It is being treated as a new build with p_nom = 0, so it can only contribute if it is extendable. If this row represents existing plant, set Status = 0."
 
             # --- Robust Quantity Logic ---
             qty = 1
@@ -1380,7 +1507,7 @@ def run_model(
             profile_col_name = row.get('Profile Column')
             profile_data_found = None
 
-            if carrier in get_renewable_carriers():
+            if carrier in get_variable_profile_carriers():
                 actual_profile_col_to_use = None
                 
                 # Check if specific profile column is provided and exists
@@ -1410,15 +1537,36 @@ def run_model(
                         if carrier == 'Hydro': p_min_pu_value = profile_data_found.values
                     yield f"[{datetime.now().strftime('%H:%M:%S')}] Generator '{gen_i}' ({carrier}) using profile: '{actual_profile_col_to_use}'."
                 else:
-                    yield f"[{datetime.now().strftime('%H:%M:%S')}] WARNING: Generator '{gen_i}' ({carrier}) is renewable but no valid profile found (tried '{profile_col_name}' and generic '{carrier} profile'). It will produce 0 power."
+                    yield f"[{datetime.now().strftime('%H:%M:%S')}] WARNING: Generator '{gen_i}' ({carrier}) requires an availability profile but none was found (tried '{profile_col_name}' and generic '{carrier} profile'). It will produce 0 power."
                     p_max_pu_value = 0.0
                     if carrier == 'Hydro': p_min_pu_value = 0.0
 
-            p_nom_min_gen = float(row.get('P_nom_min', 0.0))
-            p_nom_max_gen = float(row.get('P_nom_max', np.inf))
+            # Guard: a generator whose availability has been forced to zero cannot
+            # also carry a positive minimum-output floor. p_min_pu > p_max_pu makes
+            # the unit infeasible the moment any capacity is fixed or forced.
+            if np.isscalar(p_max_pu_value) and float(p_max_pu_value) == 0.0 and p_min_pu_value != 0.0:
+                yield f"[{datetime.now().strftime('%H:%M:%S')}] WARNING: Generator '{gen_i}' ({carrier}) has p_min_pu={p_min_pu_value} but zero availability; p_min_pu reset to 0 to keep the problem feasible."
+                p_min_pu_value = 0.0
+
+            p_nom_min_gen = _num(row.get('P_nom_min'), 0.0)
+            p_nom_max_gen = _num(row.get('P_nom_max'), np.inf)
+            if np.isnan(p_nom_max_gen):
+                p_nom_max_gen = np.inf
+            if p_nom_extendable and not np.isfinite(p_nom_max_gen):
+                yield f"[{datetime.now().strftime('%H:%M:%S')}] WARNING: Generator '{gen_i}' ({carrier}) is extendable with no P_nom_max, so the model may build unlimited capacity of it. Set a P_nom_max unless unbounded expansion is intended."
 
             # --- Instantiation Loop for multiple units if Quantity > 1 ---
             count_to_add = qty if qty > 0 else 1
+
+            # P_nom_min / P_nom_max are stated for the plant as a whole, the same basis
+            # as Capacity(MW), but they were applied unchanged to EVERY instance. With
+            # Quantity = 2 that doubled both bounds: Tagape_CNO1 (Capacity 1.6 MW,
+            # Quantity 2) was bounded at 1.6 MW per unit, i.e. 3.2 MW of plant.
+            if count_to_add > 1:
+                if p_nom_min_gen > 0:
+                    p_nom_min_gen = p_nom_min_gen / count_to_add
+                if np.isfinite(p_nom_max_gen):
+                    p_nom_max_gen = p_nom_max_gen / count_to_add
             
             for i in range(1, count_to_add + 1):
                 gen_name_instance = gen_i # Default name for single units
@@ -1439,6 +1587,12 @@ def run_model(
                 p_nom_set_for_add = 0.0
                 if status == 0: # Existing generator
                     p_nom_set_for_add = p_nom_instance_val
+
+                # A new-build row (Status = 1) starts at p_nom = 0, so unless it is
+                # extendable its capacity is permanently locked at zero and it can
+                # never contribute. Previously this passed silently.
+                if status == 1 and not p_nom_extendable:
+                    yield f"[{datetime.now().strftime('%H:%M:%S')}] WARNING: Generator '{gen_name_instance}' ({carrier}) is flagged as a new build (Status = 1) but is not extendable, so its capacity is fixed at 0 MW and it can never generate. Set p_nom_extendable = TRUE, or set Status = 0 with a non-zero Capacity(MW)."
                 
                 n.add("Generator",
                       gen_name_instance,
@@ -1520,21 +1674,54 @@ def run_model(
 
             name = f"Line_{from_bus}_{to_bus}_{i}"
             
-            s_nom_extendable = bool(row.get('s_nom_extendable', line_expansion)) # Use project-level line_expansion if not specified
+            s_nom_extendable = _flag(row.get('s_nom_extendable'), line_expansion) # Use project-level line_expansion if not specified
 
             line_lifetime = int(float(row.get('lifetime', 25))) if pd.notna(row.get('lifetime', 25)) else 25
             line_capital_cost_raw = float(row.get('Capital_cost (USD/MVA)', 0.0))
             annuitized_line_capex = calculate_annuity(line_capital_cost_raw, discount_rate, line_lifetime)
 
+            line_length = _num(row.get('Length (kM)'), 1.0)
+
+            # --- Impedance -------------------------------------------------
+            # PyPSA needs a non-zero reactance on every passive branch. Previously
+            # no x/r were passed at all, so every line was built with x = r = 0.
+            # If every branch in a connected sub-network has zero impedance the
+            # susceptance matrix is singular and n.optimize() aborts with
+            # "LinAlgError: SVD did not converge"; where it does not abort, the
+            # power flows it reports are not physically meaningful.
+            #
+            # 'type' is only passed through when it names a real PyPSA standard
+            # line type. A free-text value such as "AC" raises
+            # ValueError: The type(s) AC do(es) not exist in n.line_types.
+            line_type_raw = row.get('type', None)
+            line_type = str(line_type_raw).strip() if pd.notna(line_type_raw) else ""
+            use_type = line_type in n.line_types.index
+
+            line_kwargs = {}
+            if use_type:
+                line_kwargs['type'] = line_type
+            else:
+                if line_type:
+                    yield f"[{datetime.now().strftime('%H:%M:%S')}] WARNING: Line '{name}' type '{line_type}' is not a PyPSA standard line type; using explicit impedance instead."
+                x_val = _num(row.get('x'), 0.0)
+                r_val = _num(row.get('r'), 0.0)
+                if not (x_val > 0.0):   # covers 0, negative and NaN
+                    # Per-km default for a distribution/sub-transmission overhead line.
+                    x_val = DEFAULT_LINE_X_PER_KM * max(line_length, 1e-3)
+                    r_val = r_val if r_val > 0.0 else DEFAULT_LINE_R_PER_KM * max(line_length, 1e-3)
+                    yield f"[{datetime.now().strftime('%H:%M:%S')}] WARNING: Line '{name}' has no reactance in the input data. Applying default x={x_val:.4f} ohm, r={r_val:.4f} ohm. Supply 'x' and 'r' columns for a physically meaningful power flow."
+                line_kwargs['x'] = x_val
+                line_kwargs['r'] = r_val
+
             n.add("Line",
                   name,
                   bus0=from_bus,
                   bus1=to_bus,
-                  type=row.get('type', None),
                   s_nom=float(row.get('s_nom', 0.0)) if not s_nom_extendable else 0.0, # Initial s_nom is 0 if extendable
                   s_nom_extendable=s_nom_extendable,
                   capital_cost=annuitized_line_capex,
-                  length=float(row.get('Length (kM)', 1.0)))
+                  length=line_length,
+                  **line_kwargs)
             lines_added_count += 1
             yield f"[{datetime.now().strftime('%H:%M:%S')}] Added Line '{name}': {from_bus} <-> {to_bus}, s_nom={row.get('s_nom', 0.0):.2f}, extendable={s_nom_extendable}."
         yield f"[{datetime.now().strftime('%H:%M:%S')}] Total {lines_added_count} transmission lines added."
@@ -1586,15 +1773,22 @@ def run_model(
             s_nom_total = s_nom_single_unit * num_parallel  # Calculate total capacity
             # --- END OF FIX ---
 
+            # Same requirement as for lines: a transformer with x = 0 contributes a
+            # singular row to the susceptance matrix.
+            trafo_x = _num(row.get('x'), 0.0)
+            trafo_r = _num(row.get('r'), 0.0)
+            if not (trafo_x > 0.0):   # covers 0, negative and NaN
+                trafo_x = DEFAULT_TRANSFORMER_X
+                trafo_r = trafo_r if trafo_r > 0.0 else DEFAULT_TRANSFORMER_R
+                yield f"[{datetime.now().strftime('%H:%M:%S')}] WARNING: Transformer '{name}' has no reactance in the input data. Applying default x={trafo_x} p.u., r={trafo_r} p.u. Supply 'x' and 'r' columns for a physically meaningful power flow."
+
             n.add("Transformer",
                   name,
                   bus0=bus0,
                   bus1=bus1,
                   s_nom=s_nom_total,
-                  v_nom0=float(row.get('v_nom0', 0.0)),
-                  v_nom1=float(row.get('v_nom1', 0.0)),
-                  x=float(row.get('x', 0.0)),
-                  r=float(row.get('r', 0.0)),
+                  x=trafo_x,
+                  r=trafo_r,
                   capital_cost=annuitized_transformer_capex)
             transformers_added_count += 1
             yield f"[{datetime.now().strftime('%H:%M:%S')}] Added Transformer '{name}': {bus0} <-> {bus1}, s_nom_total={s_nom_total:.2f} MVA ({num_parallel}x{s_nom_single_unit:.2f} MVA), extendable={False}."
@@ -1644,7 +1838,12 @@ def run_model(
 
             e_nom_initial = e_nom_storage if status == 0 else 0.0 # Initial capacity is 0 for new builds
 
-            e_nom_extendable = bool(row.get('e_nom_extendable', False))
+            e_nom_extendable = _flag(row.get('e_nom_extendable'), False)
+
+            # Same trap as for generators: a new-build storage row that is not
+            # extendable is permanently locked at 0 MWh.
+            if status == 1 and not e_nom_extendable:
+                yield f"[{datetime.now().strftime('%H:%M:%S')}] WARNING: Storage '{sto_i}' is flagged as a new build (Status = 1) but is not extendable, so its energy capacity is fixed at 0 MWh and it can never store anything. Set e_nom_extendable = TRUE, or set Status = 0 with a non-zero e_nom (MWh)."
             lifetime = int(float(row.get('lifetime', 20.0))) if pd.notna(row.get('lifetime', 20.0)) else 20
 
             marginal_cost_storage = float(row.get('Marginal cost (USD/MWh)', 0.0))
@@ -1701,11 +1900,41 @@ def run_model(
     # Constraints
     # --------------------------
     renewable_carriers = get_renewable_carriers()
+    # Default to 0.0 so the attribute is 0/1 rather than 1/NaN. PyPSA treats a NaN
+    # coefficient as 0 either way, so this changes no result; it makes the carriers
+    # table readable and the constraint's basis explicit.
+    n.carriers['renewable'] = 0.0
     for carrier_name in renewable_carriers:
         if carrier_name in n.carriers.index:
             n.carriers.loc[carrier_name, 'renewable'] = 1.0
         else:
-            yield f"[{datetime.now().strftime('%H:%M:%S')}] WARNING: Renewable carrier '{carrier_name}' not found in network carriers defined in this scenario. Ensure all carriers are added to PyPSA network."
+            # Informational only: the renewable list is deliberately broader than any
+            # one scenario. This is not an error unless the carrier is one the
+            # scenario actually uses.
+            yield f"[{datetime.now().strftime('%H:%M:%S')}] Note: renewable carrier '{carrier_name}' is not used in this scenario."
+
+    # Pre-solve feasibility check: a scenario in which nothing but the slack
+    # generator can produce power will either be infeasible or return a
+    # meaningless all-slack result. Warn before spending solver time.
+    usable = n.generators[(n.generators.carrier != 'slack')]
+    if not usable.empty:
+        can_generate = usable[(usable.p_nom_extendable) | (usable.p_nom > 0)]
+        zero_availability = [g for g in can_generate.index
+                             if (n.generators_t.p_max_pu[g].max() == 0
+                                 if g in n.generators_t.p_max_pu.columns
+                                 else n.generators.at[g, 'p_max_pu'] == 0)]
+        if len(can_generate) == 0:
+            yield f"[{datetime.now().strftime('%H:%M:%S')}] WARNING: No non-slack generator in this scenario has any capacity or is extendable. Demand can only be met by the slack generator. Check that the enabled technologies have candidate rows for this scenario number, and that new-build rows are flagged p_nom_extendable = TRUE."
+        elif len(zero_availability) == len(can_generate):
+            yield f"[{datetime.now().strftime('%H:%M:%S')}] WARNING: Every non-slack generator in this scenario has zero availability. Demand can only be met by the slack generator. Check that any profile-based carrier has a matching profile column in the generation profiles sheet."
+
+    # PyPSA's own pre-solve validation. This catches zero-reactance branches,
+    # p_min_pu > p_max_pu and unattached components before any solver time is spent,
+    # and covers classes of error the checks above do not.
+    try:
+        n.consistency_check()
+    except Exception as exc:
+        yield f"[{datetime.now().strftime('%H:%M:%S')}] WARNING: PyPSA consistency check reported: {type(exc).__name__}: {exc}"
 
     if co2_cap is not None and co2_cap > 0:
         n.add("GlobalConstraint", "CO2_CAP",
@@ -1729,22 +1958,66 @@ def run_model(
     # --------------------------
     # Optimization
     # --------------------------
+    EXTRA_FUNCTIONALITY_LOG.clear()
+
+    # Any committable generator that is not extendable turns this into a mixed-integer
+    # problem with one binary per unit per hour (8760 x units). With default solver
+    # settings that can fail to converge in any usable time. Apply a relative MIP gap
+    # and a time limit unless the caller supplies their own.
+    solver_options = dict(solver_options or {})
+    committable_units = n.generators[(n.generators.get('committable', False) == True) &
+                                     (~n.generators.p_nom_extendable)] if 'committable' in n.generators else []
+    if len(committable_units) > 0:
+        n_binaries = len(committable_units) * len(n.snapshots)
+        yield f"[{datetime.now().strftime('%H:%M:%S')}] NOTE: {len(committable_units)} committable non-extendable generator(s) make this a mixed-integer problem (~{n_binaries:,} binary variables). Expect a substantially longer solve than a linear run."
+        if solver.lower() == 'highs':
+            solver_options.setdefault('mip_rel_gap', 0.01)
+            solver_options.setdefault('time_limit', 1800)
+            yield f"[{datetime.now().strftime('%H:%M:%S')}] Applying solver options {solver_options} so the run terminates. Tighten mip_rel_gap for a more exact answer."
+
     yield f"[{datetime.now().strftime('%H:%M:%S')}] Starting optimization with solver: {solver}..."
     # --- START OF FIX: Pass dispatchable_share and minimum_soc to extra_functionality ---
     # Only use extra_functionality if at least one constraint is active
-    if (dispatchable_share is not None and dispatchable_share > 0) or \
-       (minimum_soc is not None and minimum_soc > 0):
-        # Pass parameters to the combined_extra_functionality wrapper
-        n.optimize(solver_name=solver,
-                   extra_functionality=lambda n_net, snapshots: combined_extra_functionality(n_net, snapshots, dispatchable_share, minimum_soc))
-    else:
-        n.optimize(solver_name=solver)
-    # --- END OF FIX ---
-    yield f"[{datetime.now().strftime('%H:%M:%S')}] Optimization finished."
+    # The return value of n.optimize() must be inspected. Previously it was
+    # discarded, so an infeasible or failed solve fell straight through to the
+    # output-writing block and the run was reported as successful while writing
+    # empty result files.
+    try:
+        if (dispatchable_share is not None and dispatchable_share > 0) or \
+           (minimum_soc is not None and minimum_soc > 0):
+            # Pass parameters to the combined_extra_functionality wrapper
+            status, condition = n.optimize(
+                solver_name=solver, solver_options=solver_options,
+                extra_functionality=lambda n_net, snapshots: combined_extra_functionality(n_net, snapshots, dispatchable_share, minimum_soc))
+        else:
+            status, condition = n.optimize(solver_name=solver, solver_options=solver_options)
+    except Exception as exc:
+        yield f"[{datetime.now().strftime('%H:%M:%S')}] ERROR: Optimization aborted with {type(exc).__name__}: {exc}"
+        if isinstance(exc, np.linalg.LinAlgError):
+            yield f"[{datetime.now().strftime('%H:%M:%S')}] ERROR: This is normally caused by lines or transformers with zero reactance. Check the 'x' column of the Transmission Lines and Transformers sheets."
+        raise RuntimeError(f"Optimization aborted: {type(exc).__name__}: {exc}") from exc
+
+    # Drain any messages raised while building extra constraints inside the solve.
+    while EXTRA_FUNCTIONALITY_LOG:
+        yield EXTRA_FUNCTIONALITY_LOG.pop(0)
+
+    yield f"[{datetime.now().strftime('%H:%M:%S')}] Optimization finished. Solver status: {status}, termination condition: {condition}."
+
+    if str(condition).lower() not in ("optimal", "suboptimal"):
+        yield f"[{datetime.now().strftime('%H:%M:%S')}] ERROR: Solver did not reach an optimal solution (status='{status}', condition='{condition}'). No results have been produced."
+        if str(condition).lower() == "infeasible":
+            yield f"[{datetime.now().strftime('%H:%M:%S')}] ERROR: The model is infeasible. Common causes: a RE Share Target or CO2 cap that the enabled technologies cannot meet; every generator of an enabled technology forced to zero availability; or insufficient candidate capacity with no unserved-energy outlet."
+        raise RuntimeError(
+            f"Optimization did not solve to optimality (status='{status}', condition='{condition}'). "
+            f"Results were not written because they would be empty or invalid.")
 
     # --- DIAGNOSTICS ---
     yield f"[{datetime.now().strftime('%H:%M:%S')}] --- OPTIMIZATION DIAGNOSTICS ---"
-    yield f"[{datetime.now().strftime('%H:%M:%S')}] Objective: {n.objective:.2f}" if n.objective is not None else "[Not Available]"
+    objective_value = getattr(n, "objective", None)
+    if objective_value is None or (isinstance(objective_value, float) and np.isnan(objective_value)):
+        yield f"[{datetime.now().strftime('%H:%M:%S')}] Objective: [Not Available]"
+    else:
+        yield f"[{datetime.now().strftime('%H:%M:%S')}] Objective: {objective_value:.2f}"
     yield f"[{datetime.now().strftime('%H:%M:%S')}] Generators_t.p is empty: {n.generators_t.p.empty}"
     if not n.generators_t.p.empty:
         yield f"[{datetime.now().strftime('%H:%M:%S')}] Dispatch nonzero: {n.generators_t.p.sum().sum() > 0}"
